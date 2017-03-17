@@ -8,56 +8,46 @@ REPLICA_SETS=${REPLICA_SETS:-rs}
 MONGODB_PORT=${MONGODB_PORT:-27017}
 
 set services= master= i=
-docker_api() { curl -sN --unix-socket /run/docker.sock http:/v1.26/$*; }
+#docker_api() { curl -sN --unix-socket /run/docker.sock http:/v1.26/$*; }
 
 get_primary() {
 	services=$(nslookup tasks.$NETWORK_NAME 2>/dev/null | awk "/Addr/ {print \$4\":$MONGODB_PORT\"}")
 	for i in $services; do
-		[ -n $(mongo $i --quiet --eval 'rs.isMaster().setName' 2>&1) ] \
+		[ -n "$(mongo $i --quiet --eval 'rs.isMaster().setName' 2>&1)" ] \
 			&& master=$(mongo $i --quiet --eval "rs.status().members.find(r=>r.state===1).name") \
 			&& return
-	done || mongo $i --quiet --eval "rs.initiate()" && master=$i \
+	done || mongo $i --quiet --eval "rs.initiate()" >/dev/null && master=$i \
 		|| { echo Database is broken; exit; }
 }
 
-add_node() {
+sets() {
 	mongo $master --eval "rs.isMaster().ismaster" | grep -q true || get_primary
-	mongo $master --eval "rs.add(\"$1\")" >/dev/null && echo +$1
+	mongo $master --eval "rs.$1(\"$2\")" >/dev/null && echo $1 $2
 }
 
-del_node() {
-	mongo $master --eval "rs.isMaster().ismaster" | grep -q true || get_primary
-	mongo $master --eval "rs.remove(\"$1\")" >/dev/null && echo -$1
-}
-
-del_down_nodes() {
-	mongo $master --eval "rs.isMaster().ismaster" | grep -q true || get_primary
-	for i in $(mongo $master --quiet --eval 'rs.status().members.filter(r=>r.state===8).map(r=>r.name).join(" ")'); do
-		del_node $i
-	done
-}
-
-echo -n .. Service $SERVICE_NAME is\  && docker_api services/$SERVICE_NAME \
-	| grep -q 'ID' && echo UP || { echo DOWN; exit 1; }
+echo -n .. Service $SERVICE_NAME is\  && docker service ps $SERVICE_NAME >/dev/null \
+	&& echo UP || { echo DOWN; exit 1; }
 
 echo -n .. Master -\  && get_primary && echo $master
 
 echo .. Remove down replica sets
-del_down_nodes
+for i in $(mongo $master --quiet --eval 'rs.status().members.filter(r=>r.state===8).map(r=>r.name).join(" ")'); do
+	sets remove $i
+done
 
 echo .. Add uninitialized services
 for i in $services; do
-	mongo $i --quiet --eval 'rs.status().members.find(r=>r.state===1).self' &>/dev/null || add_node $i
+	mongo $i --eval 'rs.status().members.find(r=>r.state===1).self' &>/dev/null || sets add $i
 done
 
 echo .. Listen for docker container events
-set -x
-while IFS= read -r l; do
-	echo $l | grep -q docker.swarm.service.name\":\"$SERVICE_NAME\" || continue
-	case $(echo $l | sed -n 's/.*status":"\([a-z]*\).*/\1/p') in
-		start) add_node $(echo $l | sed "s/.*name\":\"\([a-z0-9.]*\)\".*/\1/").$NETWORK_NAME;;
-		destroy) del_down_nodes;;
-	esac
-done <<EOF
-$(docker_api events -Gd filters={\"type\":[\"container\"]})
-EOF
+docker events -f type=container -f event=start -f event=die \
+	-f service=$SERVICE_NAME -f network=$NETWORK_NAME |
+{
+	while read -r l; do
+		case $l in
+			*start*) sets add $(echo $l | sed 's/.* name=\(.*\))$/\1/').$NETWORK_NAME;;
+			*die*)   sets remove $(echo $l | sed 's/.* name=\(.*\))$/\1/').$NETWORK_NAME;;
+		esac
+	done
+}
